@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/ethereum/go-ethereum/common"
+	"golang.org/x/crypto/sha3"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -1088,6 +1089,18 @@ func traversalVar(ctx *cli.Context) error {
 		return err
 	}
 
+	cc := common.HexToAddress("0x7acb886287e665f383bee198241442b781dc6385")
+	ccHash := crypto.HashData(sha3.NewLegacyKeccak256().(crypto.KeccakState), cc.Bytes())
+
+	cc1 := common.HexToAddress("0x0000000000000000000000000000000000001000")
+	ccHash1 := crypto.HashData(sha3.NewLegacyKeccak256().(crypto.KeccakState), cc1.Bytes())
+	fmt.Printf("System contract hash %s\n", ccHash1.String())
+
+	fmt.Printf("contract hash %s\n", ccHash.String())
+	a, err := snap.Account(ccHash)
+	fmt.Println(a)
+	fmt.Println(err)
+
 	//
 	pool := make(chan struct{}, 20)
 	defer close(pool)
@@ -1100,7 +1113,7 @@ func traversalVar(ctx *cli.Context) error {
 	for it.Next() {
 		key := it.Key()
 		switch {
-		case bytes.HasPrefix(key, rawdb.SnapshotAccountPrefix) && len(key) == (len(rawdb.SnapshotAccountPrefix)+common.HashLength):
+		case bytes.HasPrefix(key, rawdb.SnapshotAccountPrefix) && len(key) == (len(rawdb.SnapshotAccountPrefix)+common.Hgit ashLength):
 			log.Info("DebugInfo", common.BytesToHash(key[1:]))
 			cc := common.HexToAddress("0xC806e70a62eaBC56E3Ee0c2669c2FF14452A9B3d")
 			log.Info(crypto.Keccak256Hash(cc[:]).String())
