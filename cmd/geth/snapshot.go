@@ -22,12 +22,10 @@ import (
 	"errors"
 	"fmt"
 	"github.com/ethereum/go-ethereum/common"
-	"golang.org/x/crypto/sha3"
 	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/prometheus/tsdb/fileutil"
@@ -226,43 +224,17 @@ the expected order for the overlay tree migration.
 `,
 			},
 			{
-				Name:      "traverse-var",
-				Usage:     "Dump a specific block from storage (same as 'geth dump' but using snapshots)",
+				Name:      "inspect-storage",
+				Usage:     "Statistical variable data for all contracts",
 				ArgsUsage: "[? <blockHash> | <blockNum>]",
-				Action:    traversalVar,
+				Action:    inspectStorage,
 				Flags: flags.Merge([]cli.Flag{
-					utils.ExcludeCodeFlag,
-					utils.ExcludeStorageFlag,
-					utils.StartKeyFlag,
-					utils.DumpLimitFlag,
-					utils.TriesInMemoryFlag,
-				}, utils.NetworkFlags, utils.DatabaseFlags),
+					utils.CPUCountFlag,
+				}, utils.DatabaseFlags),
 				Description: `
-This command is semantically equivalent to 'geth dump', but uses the snapshots
-as the backend data source, making this command a lot faster.
+This command collects the variable information of all contracts from snapshot.
 
-The argument is interpreted as block number or hash. If none is provided, the latest
-block is used.
-`,
-			},
-			{
-				Name:      "keccak256",
-				Usage:     "Dump a specific block from storage (same as 'geth dump' but using snapshots)",
-				ArgsUsage: "[? <blockHash> | <blockNum>]",
-				Action:    keccak256,
-				Flags: flags.Merge([]cli.Flag{
-					utils.ExcludeCodeFlag,
-					utils.ExcludeStorageFlag,
-					utils.StartKeyFlag,
-					utils.DumpLimitFlag,
-					utils.TriesInMemoryFlag,
-				}, utils.NetworkFlags, utils.DatabaseFlags),
-				Description: `
-This command is semantically equivalent to 'geth dump', but uses the snapshots
-as the backend data source, making this command a lot faster.
-
-The argument is interpreted as block number or hash. If none is provided, the latest
-block is used.
+The argument is interpreted as the number of cpus.
 `,
 			},
 		},
@@ -1064,7 +1036,7 @@ func checkAccount(ctx *cli.Context) error {
 	return nil
 }
 
-func traversalVar(ctx *cli.Context) error {
+func inspectStorage(ctx *cli.Context) error {
 	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
@@ -1089,22 +1061,15 @@ func traversalVar(ctx *cli.Context) error {
 		return err
 	}
 
-	cc := common.HexToAddress("0x7acb886287e665f383bee198241442b781dc6385")
-	ccHash := crypto.HashData(sha3.NewLegacyKeccak256().(crypto.KeccakState), cc.Bytes())
+	// init key
+	keySet := make([]common.Hash, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		key := common.BigToHash(big.NewInt(int64(i)))
+		keySet = append(keySet, crypto.Keccak256Hash(key.Bytes()))
+	}
 
-	cc1 := common.HexToAddress("0x0000000000000000000000000000000000001000")
-	ccHash1 := crypto.HashData(sha3.NewLegacyKeccak256().(crypto.KeccakState), cc1.Bytes())
-	fmt.Printf("System contract hash %s\n", ccHash1.String())
-
-	fmt.Printf("contract hash %s\n", ccHash.String())
-	a, err := snap.Account(ccHash)
-	fmt.Println(a)
-	fmt.Println(err)
-
-	//
-	pool := make(chan struct{}, 20)
-	defer close(pool)
-	waitGroup := &sync.WaitGroup{}
+	cpuCount := ctx.Int64(utils.CPUCountFlag.Name)
+	p := NewRoutinePool(cpuCount*100, snap, keySet)
 
 	it := db.NewIterator(rawdb.SnapshotAccountPrefix, nil)
 	defer it.Release()
@@ -1113,61 +1078,45 @@ func traversalVar(ctx *cli.Context) error {
 	for it.Next() {
 		key := it.Key()
 		switch {
-		case bytes.HasPrefix(key, rawdb.SnapshotAccountPrefix) && len(key) == (len(rawdb.SnapshotAccountPrefix)+common.Hgit ashLength):
-			log.Info("DebugInfo", common.BytesToHash(key[1:]))
-			cc := common.HexToAddress("0xC806e70a62eaBC56E3Ee0c2669c2FF14452A9B3d")
-			log.Info(crypto.Keccak256Hash(cc[:]).String())
-			addrHash := common.BytesToHash(key[1:])
-			log.Info(fmt.Sprintf("address:%s", addrHash.String()))
-			pool <- struct{}{}
-			waitGroup.Add(1)
-			go func(address common.Hash) {
-				defer waitGroup.Done()
-				<-pool
-				traversalContract(snap, address)
-			}(addrHash)
+		case bytes.HasPrefix(key, rawdb.SnapshotAccountPrefix) && len(key) == (len(rawdb.SnapshotAccountPrefix)+common.HashLength):
+			var account types.SlimAccount
+			err := rlp.DecodeBytes(it.Value(), &account)
+			if err != nil {
+				log.Error("failed to DecodeBytes", "addrHash", key[1:])
+				continue
+			}
+			if common.Bytes2Hex(account.CodeHash) == types.EmptyCodeHash.String() {
+				continue
+			}
+			p.AddTask(common.BytesToHash(key[1:]))
 		}
 	}
 
-	waitGroup.Wait()
+	p.Wait()
+	fmt.Println("all done")
+	fmt.Println("var count", p.varCount.Load())
+	fmt.Println("arr count", p.arrCount.Load())
+	fmt.Println("arr item count", p.arrItemCount.Load())
 
 	return nil
 }
 
-func traversalContract(snapshot snapshot.Snapshot, contractAddress common.Hash) {
-	var slimAccount *types.SlimAccount
-	var err error
-	for retry := 0; retry < 5; retry++ {
-		slimAccount, err = snapshot.Account(contractAddress)
-		if err != nil {
-			time.Sleep(5 * time.Millisecond)
-			continue
-		}
-		break
-	}
-	if slimAccount == nil {
-		log.Info("snapshot Account error")
-		// todo: record account by write file
-		return
-	}
-	if common.Bytes2Hex(slimAccount.CodeHash) == common.HexToHash("").String() {
-		return
-	}
+func traversalContract(snap snapshot.Snapshot, contractAddress common.Hash, keySet []common.Hash) (int, int, int) {
 	emptyKeyCount := 0
 	varCount := 0
 	arrayCount := 0
 	arrayVarCount := 0
-	for i := 0; ; i++ {
-		key := common.BigToHash(big.NewInt(int64(i)))
-		enc, encErr := snapshot.Storage(contractAddress, crypto.Keccak256Hash(key.Bytes()))
+
+	for _, storageHash := range keySet {
+		enc, encErr := snap.Storage(contractAddress, storageHash)
 		if encErr != nil {
-			log.Info(fmt.Sprintf("key: %s, storage error: %v", key.String(), encErr))
+			log.Info(fmt.Sprintf("key: %s, storage error: %v", storageHash.String(), encErr))
+
 			continue
 		}
 		if len(enc) > 0 {
-			log.Info(common.BytesToHash(enc).String())
 			emptyKeyCount = 0
-			if isArr, arrLen := isArray(snapshot, contractAddress, key); isArr {
+			if isArr, arrLen := isArray(snap, contractAddress, storageHash); isArr {
 				arrayVarCount += arrLen
 				arrayCount++
 			} else {
@@ -1181,24 +1130,29 @@ func traversalContract(snapshot snapshot.Snapshot, contractAddress common.Hash) 
 			break
 		}
 	}
-	log.Info("array count:", arrayCount, "array item count", arrayVarCount, "var count", varCount)
+	//log.Info("array count:", arrayCount, "array item count", arrayVarCount, "var count", varCount)
+
+	return arrayCount, arrayVarCount, varCount
 }
 
 func isArray(snap snapshot.Snapshot, contractAddress common.Hash, slotIdx common.Hash) (result bool, slotLen int) {
-	start := crypto.Keccak256Hash(slotIdx.Bytes())
 	emptyValue := 0
 	hasValue := false
+	errTime := 0
 	for i := 0; ; i++ {
-		idx := common.BigToHash(big.NewInt(0).Add(start.Big(), big.NewInt(int64(i))))
+		if errTime > 100 {
+			break
+		}
+		idx := common.BigToHash(big.NewInt(0).Add(slotIdx.Big(), big.NewInt(int64(i))))
 		enc, err := snap.Storage(contractAddress, crypto.Keccak256Hash(idx.Bytes()))
 		if err != nil {
-			log.Info("storage error", err.Error(), "slot", idx.String())
+			fmt.Printf("storage error:%s", err.Error())
+			errTime++
 			continue
 		}
 		if len(enc) == 0 {
 			emptyValue++
 		} else {
-			log.Info("isArray " + common.BytesToHash(enc).String())
 			emptyValue = 0
 			hasValue = true
 			slotLen++
@@ -1209,81 +1163,4 @@ func isArray(snap snapshot.Snapshot, contractAddress common.Hash, slotIdx common
 	}
 	result = hasValue
 	return
-}
-
-/*
-// SPDX-License-Identifier: MIT
-pragma solidity >=0.6.12 <0.9.0;
-
-contract HelloWorld {
-  uint a;
-  bytes32 b;
-  mapping(uint => uint) c;
-  uint[3] d;
-  uint[] e;
-  bytes f;
-  bool g;
-  uint256 h;
-
-
-  function print() public pure returns (string memory) {
-    return "Hello Const!";
-  }
-
-   constructor() {
-    // 状态变量通过其名称访问，而不是通过例如 this.owner 的方式访问。
-    // 这也适用于函数，特别是在构造函数中，你只能像这样（“内部地”）调用它们，
-    // 因为合约本身还不存在。
-    a = 1;
-    b = "constbh contract";
-    for (uint i=0; i<20; i++)
-    {
-      c[i] = i;
-    }
-    d = [1,2,3];
-    e = [4,5,6];
-    f = "a";
-    g = true;
-    h = 8;
-  }
-
-  function getA() public view returns (uint) {
-    return a;
-  }
-
-  function getB() public view returns (bytes32) {
-    return b;
-  }
-
-  function getCByValue(uint key) public view returns (uint) {
-    return c[key];
-  }
-
-  function getD() public view returns (uint256[3] memory) {
-    return d;
-  }
-
-  function getE() public view returns (uint256[] memory) {
-    return e;
-  }
-
-  function getF() public view returns (bytes memory) {
-    return f;
-  }
-
-  function getG() public view returns (bool) {
-    return g;
-  }
-
-  function getH() public view returns (uint256) {
-    return h;
-  }
-}
-
-*/
-
-func keccak256(ctx *cli.Context) error {
-	address := common.HexToAddress("C806e70a62eaBC56E3Ee0c2669c2FF14452A9B3d")
-	log.Info(crypto.Keccak256Hash(address[:]).String())
-	return nil
 }

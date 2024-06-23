@@ -1145,6 +1145,13 @@ Please note that --` + MetricsHTTPFlag.Name + ` must be set to start the server.
 		Value:    params.DefaultExtraReserveForBlobRequests,
 		Category: flags.MiscCategory,
 	}
+
+	// cpu count
+	CPUCountFlag = &cli.Int64Flag{
+		Name:  "cpu",
+		Usage: "The count of cpu",
+		Value: 4,
+	}
 )
 
 var (
