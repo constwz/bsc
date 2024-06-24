@@ -1075,6 +1075,7 @@ func inspectStorage(ctx *cli.Context) error {
 	defer it.Release()
 
 	// Inspect key-value database first.
+	idx := uint64(0)
 	for it.Next() {
 		key := it.Key()
 		switch {
@@ -1088,6 +1089,8 @@ func inspectStorage(ctx *cli.Context) error {
 			if common.Bytes2Hex(account.CodeHash) == types.EmptyCodeHash.String() {
 				continue
 			}
+			fmt.Printf("add task: %d\n", idx)
+			idx++
 			p.AddTask(common.BytesToHash(key[1:]))
 		}
 	}
@@ -1097,6 +1100,26 @@ func inspectStorage(ctx *cli.Context) error {
 	fmt.Println("var count", p.varCount.Load())
 	fmt.Println("arr count", p.arrCount.Load())
 	fmt.Println("arr item count", p.arrItemCount.Load())
+
+	f, err := os.Create("result.txt")
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	_, err = f.WriteString(fmt.Sprintf("var count: %d\n", p.varCount.Load()))
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	_, err = f.WriteString(fmt.Sprintf("arr count: %d\n", p.arrCount.Load()))
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	_, err = f.WriteString(fmt.Sprintf("arr item count: %d\n", p.arrItemCount.Load()))
+	if err != nil {
+		fmt.Println(err)
+	}
 
 	return nil
 }
