@@ -1085,7 +1085,7 @@ func inspectStorage(ctx *cli.Context) error {
 				log.Error("failed to DecodeBytes", "addrHash", key[1:])
 				continue
 			}
-			if common.Bytes2Hex(account.CodeHash) == types.EmptyCodeHash.String() {
+			if bytes.Equal(account.CodeHash, types.EmptyCodeHash.Bytes()) {
 				continue
 			}
 			fmt.Printf("add task: %d\n", idx)

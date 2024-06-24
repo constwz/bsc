@@ -1149,7 +1149,7 @@ Please note that --` + MetricsHTTPFlag.Name + ` must be set to start the server.
 	// cpu count
 	CPUCountFlag = &cli.Int64Flag{
 		Name:  "cpu",
-		Usage: "The count of cpu",
+		Usage: "core number",
 		Value: 4,
 	}
 )
