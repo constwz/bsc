@@ -224,10 +224,9 @@ the expected order for the overlay tree migration.
 `,
 			},
 			{
-				Name:      "inspect-storage",
-				Usage:     "Statistical variable data for all contracts",
-				ArgsUsage: "[? <blockHash> | <blockNum>]",
-				Action:    inspectStorage,
+				Name:   "inspect-storage",
+				Usage:  "Statistical variable data for all contracts",
+				Action: inspectStorage,
 				Flags: flags.Merge([]cli.Flag{
 					utils.CPUCountFlag,
 				}, utils.DatabaseFlags),
