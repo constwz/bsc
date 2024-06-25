@@ -1169,7 +1169,10 @@ func inspectStorage(ctx *cli.Context) error {
 
 	storageKeyCount := uint64(0)
 	for storageIt.Next() {
-		storageKeyCount++
+		key := storageIt.Key()
+		if len(key) == (len(rawdb.SnapshotStoragePrefix) + 2*common.HashLength) {
+			storageKeyCount++
+		}
 	}
 	fmt.Printf("storage key count: %d", storageKeyCount)
 	_, err = f.WriteString(fmt.Sprintf("storage key count: %d\n", storageKeyCount))
