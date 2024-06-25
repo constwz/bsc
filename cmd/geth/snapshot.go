@@ -25,7 +25,9 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/tsdb/fileutil"
@@ -1088,7 +1090,9 @@ func inspectStorage(ctx *cli.Context) error {
 			if bytes.Equal(account.CodeHash, types.EmptyCodeHash.Bytes()) {
 				continue
 			}
-			fmt.Printf("add task: %d\n", idx)
+			if idx%10000 == 0 {
+				fmt.Printf("add task: %d\n", idx)
+			}
 			idx++
 			p.AddTask(common.BytesToHash(key[1:]))
 		}
@@ -1120,10 +1124,66 @@ func inspectStorage(ctx *cli.Context) error {
 		fmt.Println(err)
 	}
 
+	_, err = f.WriteString(fmt.Sprintf("empty contract count: %d\n", p.emptyContract.Load()))
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	arrCount := make([]int, 0, len(p.arrItemCountMap))
+	for k := range p.arrItemCountMap {
+		arrCount = append(arrCount, k)
+	}
+	sort.Ints(arrCount)
+	sum := uint64(0)
+	maxCount := uint64(0)
+	mode := 0
+	for _, k := range arrCount {
+		count := p.arrItemCountMap[k]
+		sum += count
+		if sum >= p.arrCount.Load()/2 {
+			fmt.Printf("median: %d\n", k)
+			_, err = f.WriteString(fmt.Sprintf("median: %d\n", k))
+			if err != nil {
+				fmt.Println(err)
+			}
+			break
+		}
+	}
+
+	for _, k := range arrCount {
+		count := p.arrItemCountMap[k]
+		if maxCount < count {
+			maxCount = count
+			mode = k
+		}
+	}
+
+	fmt.Printf("mode: %d\n", mode)
+	_, err = f.WriteString(fmt.Sprintf("mode: %d\n", mode))
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	storageIt := db.NewIterator(rawdb.SnapshotStoragePrefix, nil)
+	defer storageIt.Release()
+
+	storageKeyCount := uint64(0)
+	for storageIt.Next() {
+		key := storageIt.Key()
+		if len(key) == (len(rawdb.SnapshotStoragePrefix) + 2*common.HashLength) {
+			storageKeyCount++
+		}
+	}
+	fmt.Printf("storage key count: %d", storageKeyCount)
+	_, err = f.WriteString(fmt.Sprintf("storage key count: %d\n", storageKeyCount))
+	if err != nil {
+		fmt.Println(err)
+	}
+
 	return nil
 }
 
-func traversalContract(snap snapshot.Snapshot, contractAddress common.Hash, keySet []common.Hash) (int, int, int) {
+func traversalContract(snap snapshot.Snapshot, contractAddress common.Hash, keySet []common.Hash, mapLock *sync.Mutex, arrItemCountMap map[int]uint64) (int, int, int) {
 	emptyKeyCount := 0
 	varCount := 0
 	arrayCount := 0
@@ -1141,6 +1201,9 @@ func traversalContract(snap snapshot.Snapshot, contractAddress common.Hash, keyS
 			if isArr, arrLen := isArray(snap, contractAddress, storageHash); isArr {
 				arrayVarCount += arrLen
 				arrayCount++
+				mapLock.Lock()
+				arrItemCountMap[arrLen]++
+				mapLock.Unlock()
 			} else {
 				varCount++
 			}
@@ -1148,7 +1211,7 @@ func traversalContract(snap snapshot.Snapshot, contractAddress common.Hash, keyS
 		} else {
 			emptyKeyCount++
 		}
-		if emptyKeyCount == 20 {
+		if emptyKeyCount == 100 {
 			break
 		}
 	}
