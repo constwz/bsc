@@ -21,15 +21,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/common"
+	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/tsdb/fileutil"
 
 	"github.com/ethereum/go-ethereum/cmd/utils"
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
@@ -220,6 +223,19 @@ block is used.
 				Description: `
 The export-preimages command exports hash preimages to a flat file, in exactly
 the expected order for the overlay tree migration.
+`,
+			},
+			{
+				Name:   "inspect-storage",
+				Usage:  "Statistical variable data for all contracts",
+				Action: inspectStorage,
+				Flags: flags.Merge([]cli.Flag{
+					utils.CPUCountFlag,
+				}, utils.DatabaseFlags),
+				Description: `
+This command collects the variable information of all contracts from snapshot.
+
+The argument is interpreted as the number of cpus.
 `,
 			},
 		},
@@ -1019,4 +1035,217 @@ func checkAccount(ctx *cli.Context) error {
 	}
 	log.Info("Checked the snapshot journalled storage", "time", common.PrettyDuration(time.Since(start)))
 	return nil
+}
+
+func inspectStorage(ctx *cli.Context) error {
+	stack, _ := makeConfigNode(ctx)
+	defer stack.Close()
+
+	_, db, root, err := parseDumpConfig(ctx, stack)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	tdb := utils.MakeTrieDatabase(ctx, stack, db, false, true, false)
+	defer tdb.Close()
+
+	snapConfig := snapshot.Config{
+		CacheSize:  256,
+		Recovery:   false,
+		NoBuild:    true,
+		AsyncBuild: false,
+	}
+	triesInMemory := ctx.Uint64(utils.TriesInMemoryFlag.Name)
+	snaptree, err := snapshot.New(snapConfig, db, tdb, root, int(triesInMemory), false)
+	snap := snaptree.Snapshot(root)
+	if err != nil {
+		return err
+	}
+
+	// init key
+	keySet := make([]common.Hash, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		key := common.BigToHash(big.NewInt(int64(i)))
+		keySet = append(keySet, crypto.Keccak256Hash(key.Bytes()))
+	}
+
+	cpuCount := ctx.Int64(utils.CPUCountFlag.Name)
+	p := NewRoutinePool(cpuCount*100, snap, keySet)
+
+	it := db.NewIterator(rawdb.SnapshotAccountPrefix, nil)
+	defer it.Release()
+
+	// Inspect key-value database first.
+	idx := uint64(0)
+	for it.Next() {
+		key := it.Key()
+		switch {
+		case bytes.HasPrefix(key, rawdb.SnapshotAccountPrefix) && len(key) == (len(rawdb.SnapshotAccountPrefix)+common.HashLength):
+			var account types.SlimAccount
+			err := rlp.DecodeBytes(it.Value(), &account)
+			if err != nil {
+				log.Error("failed to DecodeBytes", "addrHash", key[1:])
+				continue
+			}
+			if bytes.Equal(account.CodeHash, types.EmptyCodeHash.Bytes()) {
+				continue
+			}
+			if idx%10000 == 0 {
+				fmt.Printf("add task: %d\n", idx)
+			}
+			idx++
+			p.AddTask(common.BytesToHash(key[1:]))
+		}
+	}
+
+	p.Wait()
+	fmt.Println("all done")
+	fmt.Println("var count", p.varCount.Load())
+	fmt.Println("arr count", p.arrCount.Load())
+	fmt.Println("arr item count", p.arrItemCount.Load())
+
+	f, err := os.Create("result.txt")
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	_, err = f.WriteString(fmt.Sprintf("var count: %d\n", p.varCount.Load()))
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	_, err = f.WriteString(fmt.Sprintf("arr count: %d\n", p.arrCount.Load()))
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	_, err = f.WriteString(fmt.Sprintf("arr item count: %d\n", p.arrItemCount.Load()))
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	_, err = f.WriteString(fmt.Sprintf("empty contract count: %d\n", p.emptyContract.Load()))
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	arrCount := make([]int, 0, len(p.arrItemCountMap))
+	for k := range p.arrItemCountMap {
+		arrCount = append(arrCount, k)
+	}
+	sort.Ints(arrCount)
+	sum := uint64(0)
+	maxCount := uint64(0)
+	mode := 0
+	for _, k := range arrCount {
+		count := p.arrItemCountMap[k]
+		sum += count
+		if sum >= p.arrCount.Load()/2 {
+			fmt.Printf("median: %d\n", k)
+			_, err = f.WriteString(fmt.Sprintf("median: %d\n", k))
+			if err != nil {
+				fmt.Println(err)
+			}
+			break
+		}
+	}
+
+	for _, k := range arrCount {
+		count := p.arrItemCountMap[k]
+		if maxCount < count {
+			maxCount = count
+			mode = k
+		}
+	}
+
+	fmt.Printf("mode: %d\n", mode)
+	_, err = f.WriteString(fmt.Sprintf("mode: %d\n", mode))
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	storageIt := db.NewIterator(rawdb.SnapshotStoragePrefix, nil)
+	defer storageIt.Release()
+
+	storageKeyCount := uint64(0)
+	for storageIt.Next() {
+		key := storageIt.Key()
+		if len(key) == (len(rawdb.SnapshotStoragePrefix) + 2*common.HashLength) {
+			storageKeyCount++
+		}
+	}
+	fmt.Printf("storage key count: %d", storageKeyCount)
+	_, err = f.WriteString(fmt.Sprintf("storage key count: %d\n", storageKeyCount))
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	return nil
+}
+
+func traversalContract(snap snapshot.Snapshot, contractAddress common.Hash, keySet []common.Hash, mapLock *sync.Mutex, arrItemCountMap map[int]uint64) (int, int, int) {
+	emptyKeyCount := 0
+	varCount := 0
+	arrayCount := 0
+	arrayVarCount := 0
+
+	for _, storageHash := range keySet {
+		enc, encErr := snap.Storage(contractAddress, storageHash)
+		if encErr != nil {
+			log.Info(fmt.Sprintf("key: %s, storage error: %v", storageHash.String(), encErr))
+
+			continue
+		}
+		if len(enc) > 0 {
+			emptyKeyCount = 0
+			if isArr, arrLen := isArray(snap, contractAddress, storageHash); isArr {
+				arrayVarCount += arrLen
+				arrayCount++
+				mapLock.Lock()
+				arrItemCountMap[arrLen]++
+				mapLock.Unlock()
+			} else {
+				varCount++
+			}
+
+		} else {
+			emptyKeyCount++
+		}
+		if emptyKeyCount == 100 {
+			break
+		}
+	}
+	//log.Info("array count:", arrayCount, "array item count", arrayVarCount, "var count", varCount)
+
+	return arrayCount, arrayVarCount, varCount
+}
+
+func isArray(snap snapshot.Snapshot, contractAddress common.Hash, slotIdx common.Hash) (result bool, slotLen int) {
+	emptyValue := 0
+	hasValue := false
+	errTime := 0
+	for i := 0; ; i++ {
+		if errTime > 100 {
+			break
+		}
+		idx := common.BigToHash(big.NewInt(0).Add(slotIdx.Big(), big.NewInt(int64(i))))
+		enc, err := snap.Storage(contractAddress, crypto.Keccak256Hash(idx.Bytes()))
+		if err != nil {
+			fmt.Printf("storage error:%s", err.Error())
+			errTime++
+			continue
+		}
+		if len(enc) == 0 {
+			emptyValue++
+		} else {
+			emptyValue = 0
+			hasValue = true
+			slotLen++
+		}
+		if emptyValue == 10 {
+			break
+		}
+	}
+	result = hasValue
+	return
 }
